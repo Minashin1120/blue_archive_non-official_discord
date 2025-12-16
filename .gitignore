@@ -1,0 +1,17 @@
+# Security (絶対に公開してはいけないもの)
+.env
+config.json
+
+# Dependencies
+venv/
+__pycache__/
+*.pyc
+
+# System / Logs
+*.log
+.DS_Store
+
+# Backup files (指示により除外)
+*.bak
+*.swp
+*~
