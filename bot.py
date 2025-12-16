@@ -24,8 +24,11 @@ NOTIFY_CHANNEL_ID = 1443574124638375937
 NEW_USER_ROLE_ID = 1443870588845297694
 STATUS_CHANNEL_ID = 1443565022675468382
 
-# Bot管理者ID (スクリプトで置換されます)
-BOT_ADMIN_USER_ID = 845478953488482325
+# Bot管理者ID (攻撃検知通知用) - 前回の設定を引き継ぐ必要があるため、実行時にsedで置換するか、
+# 環境変数から読み込むのがベストだが、ここではハードコード箇所としてプレースホルダーにしておく
+# 実際には前回のスクリプト実行時の値が入っているはずだが、上書きするため再設定が必要になる可能性がある
+# 簡易的に環境変数または固定値を使う設計にする
+BOT_ADMIN_USER_ID = 0  # メンション用ID（必要なら書き換えてください）
 
 # DB設定
 DB_CONFIG = {
@@ -41,12 +44,27 @@ DB_CONFIG = {
 RATE_LIMIT_ACTIONS = 5
 RATE_LIMIT_WINDOW = 10
 USER_LOCKOUT_TIME = 300
-GLOBAL_LOCKOUT_THRESHOLD = 5 # テスト時はここを2などに変更
+GLOBAL_LOCKOUT_THRESHOLD = 5
 GLOBAL_LOCKOUT_TIME = 600
 
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
+
+# --- 署名追加関数 ---
+def add_signature(embed: discord.Embed):
+    """EmbedのDescription末尾に製作者情報とリポジトリリンクを追加する"""
+    signature = (
+        "\n\n───────────────\n"
+        "🛠️ Dev: [Minashin1120](https://x.com/Minashin1120) | 📦 [Repository](https://github.com/Minashin1120/blue_archive_non-official_discord)\n"
+        "🔒 *This bot is developed exclusively for this server.*"
+    )
+    
+    if embed.description is None or embed.description is discord.Embed.Empty:
+        embed.description = signature
+    else:
+        embed.description += signature
+    return embed
 
 # --- 負荷対策クラス ---
 class RateLimiter:
@@ -135,25 +153,21 @@ async def delete_setting(key):
 
 # --- 通知系関数 ---
 
-# 攻撃検知アラート (New)
 async def send_attack_alert(user_id, attack_type):
     channel = bot.get_channel(NOTIFY_CHANNEL_ID)
     if not channel: return
-    
     try:
-        admin_mention = f"<@{BOT_ADMIN_USER_ID}>"
-        
+        admin_mention = f"<@{BOT_ADMIN_USER_ID}>" if BOT_ADMIN_USER_ID else ""
         embed = discord.Embed(title="🚨 攻撃/スパム検知", color=0xff0000)
         embed.description = "レートリミットに抵触する過剰な操作を検知しました。"
         embed.add_field(name="実行者", value=f"<@{user_id}> (ID: {user_id})", inline=False)
         embed.add_field(name="検知内容", value=attack_type, inline=False)
         embed.timestamp = datetime.datetime.now()
-        
+        add_signature(embed) # 署名追加
         await channel.send(content=admin_mention, embed=embed)
     except Exception as e:
         print(f"Failed to send attack alert: {e}")
 
-# ユーザーアラート (新規・解除)
 async def send_user_alert(member, channel, alert_type="add", is_manual=False):
     if not channel: return
     try:
@@ -179,11 +193,12 @@ async def send_user_alert(member, channel, alert_type="add", is_manual=False):
         if member.display_avatar: embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="アカウント作成日", value=discord.utils.format_dt(member.created_at, style='f'), inline=False)
         embed.add_field(name="経過時間", value=f"{days}日 {hours}時間", inline=False)
+        
+        add_signature(embed) # 署名追加
         await channel.send(embed=embed)
     except Exception as e:
         print(f"Failed to send notification: {e}")
 
-# 緊急停止
 async def trigger_emergency_shutdown():
     print("!!! GLOBAL LOCKOUT TRIGGERED - SHUTTING DOWN !!!")
     channel = bot.get_channel(STATUS_CHANNEL_ID)
@@ -195,6 +210,7 @@ async def trigger_emergency_shutdown():
                 color=0xff0000
             )
             embed.timestamp = datetime.datetime.now()
+            add_signature(embed) # 署名追加
             msg = await channel.send(embed=embed)
             await set_setting('lockout_msg_id', msg.id)
         except: pass
@@ -211,7 +227,6 @@ class RulesView(discord.ui.View):
         status = rate_limiter.check_action(interaction.user.id)
         
         if status == "TRIGGER_GLOBAL_LOCK":
-            # 管理者通知 -> ユーザー応答 -> シャットダウン
             await send_attack_alert(interaction.user.id, "集団攻撃トリガー (システム緊急停止)")
             await interaction.response.send_message("🚨 異常検知。システムを緊急停止します。", ephemeral=True)
             await trigger_emergency_shutdown()
@@ -219,7 +234,6 @@ class RulesView(discord.ui.View):
         elif status == "GLOBAL_LOCKED":
             return
         elif status == "TRIGGER_USER_LOCK":
-            # 管理者通知 -> ユーザー応答
             await send_attack_alert(interaction.user.id, "個人スパム検知 (5分間ブロック)")
             await interaction.response.send_message("⚠️ 操作が速すぎます。5分間ブロックします。", ephemeral=True)
             return
@@ -242,7 +256,9 @@ class RulesView(discord.ui.View):
                 if notify_channel:
                     embed = discord.Embed(title="✅ ルール同意", description=f"{interaction.user.mention} がルールに同意し、参加しました。", color=0x2ecc71)
                     if interaction.user.display_avatar: embed.set_thumbnail(url=interaction.user.display_avatar.url)
-                    embed.set_footer(text=f"User ID: {interaction.user.id}"); embed.timestamp = datetime.datetime.now()
+                    embed.set_footer(text=f"User ID: {interaction.user.id}")
+                    embed.timestamp = datetime.datetime.now()
+                    add_signature(embed) # 署名追加
                     await notify_channel.send(embed=embed)
             except discord.Forbidden:
                 await interaction.response.send_message("エラー: 権限不足", ephemeral=True)
@@ -251,7 +267,7 @@ class RulesView(discord.ui.View):
         else:
             await interaction.response.send_message("既に同意済みです。", ephemeral=True)
 
-# --- タスク & イベント ---
+# --- イベント & タスク ---
 @tasks.loop(minutes=60)
 async def check_new_users_task():
     try:
@@ -287,7 +303,9 @@ async def on_ready():
                     msg = await sc.fetch_message(msg_id)
                     await msg.delete()
                 except: pass
-                await sc.send("✅ システムが復帰しました。", delete_after=30)
+                embed = discord.Embed(title="✅ システム復帰", description="システムが再起動し、正常稼働に戻りました。", color=0x2ecc71)
+                add_signature(embed)
+                await sc.send(embed=embed, delete_after=30)
             await delete_setting('lockout_msg_id')
     except: pass
 
@@ -315,6 +333,7 @@ async def on_member_join(member):
     rc = bot.get_channel(RULES_CHANNEL_ID)
     if wc and rc:
         e = discord.Embed(title=f"ようこそ {member.name} さん！", description=f"{rc.mention} を確認してください。", color=0x00ff00)
+        add_signature(e) # 署名追加
         try: await wc.send(content=member.mention, embed=e)
         except: pass
 
@@ -324,6 +343,7 @@ async def on_member_remove(member):
     if c:
         e = discord.Embed(title="👋 メンバー退出", description=f"{member.mention} 退出", color=0x95a5a6)
         e.set_footer(text=f"ID: {member.id}"); e.timestamp = datetime.datetime.now()
+        add_signature(e) # 署名追加
         try: await c.send(embed=e)
         except: pass
 
@@ -341,6 +361,7 @@ async def on_member_update(before, after):
     if added: e.add_field(name="➕ 付与", value=", ".join([r.mention for r in added]))
     if removed: e.add_field(name="➖ 解除", value=", ".join([r.mention for r in removed]))
     e.timestamp = datetime.datetime.now()
+    add_signature(e) # 署名追加
     try: await c.send(embed=e)
     except: pass
 
@@ -375,7 +396,9 @@ async def check_rate_limit(interaction: discord.Interaction):
 async def ping(interaction: discord.Interaction):
     if not await check_rate_limit(interaction): return
     latency = round(bot.latency * 1000)
-    await interaction.response.send_message(f"🏓 Pong! {latency}ms", ephemeral=True)
+    embed = discord.Embed(title="🏓 Pong!", description=f"応答速度: {latency}ms", color=0x3498db)
+    add_signature(embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="scan_users", description="手動スキャン")
 @is_admin_or_has_role()
@@ -416,6 +439,7 @@ async def scan_users(interaction: discord.Interaction):
 async def deploy_rules(interaction: discord.Interaction):
     if not await check_rate_limit(interaction): return
     e = discord.Embed(title="📜 ルール同意", description="確認してボタンを押してください。", color=0xff0000)
+    add_signature(e) # 署名追加
     await interaction.channel.send(embed=e, view=RulesView(bot))
     await interaction.response.send_message("設置完了", ephemeral=True)
 
