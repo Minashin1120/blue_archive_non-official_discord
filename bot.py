@@ -3,6 +3,9 @@ import os
 import asyncio
 import datetime
 import aiomysql
+import json
+import jwt
+import aiohttp
 from aiohttp import web
 from collections import defaultdict, deque
 from discord.ext import commands, tasks
@@ -11,21 +14,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- 環境変数 ---
+# --- 環境変数 & 設定 ---
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-WELCOME_CHANNEL_ID = int(os.getenv('WELCOME_CHANNEL_ID'))
-RULES_CHANNEL_ID = int(os.getenv('RULES_CHANNEL_ID'))
-NEW_ROLE_ID = int(os.getenv('NEW_ROLE_ID'))
 PORT = 3120
 
-# 固定ID設定
-COMMAND_ADMIN_ROLE_ID = 1443565021509586990
-NOTIFY_CHANNEL_ID = 1443574124638375937
-NEW_USER_ROLE_ID = 1443870588845297694
-STATUS_CHANNEL_ID = 1443565022675468382
+# Cloudflare & Security (キー名を.envに合わせる)
+CF_SITE_KEY = os.getenv('CF_TURNSTILE_SITE_KEY')
+CF_SECRET_KEY = os.getenv('CF_TURNSTILE_SECRET_KEY')
+JWT_SECRET = os.getenv('JWT_SECRET')
+BASE_URL = "https://buruaka-min-shugo-welcome-bot.minashin1120.com"
+
+# ロールID
+UNVERIFIED_ROLE_ID = 1443590180396335174 # 未認証
+VERIFIED_ROLE_ID = 1450301488697049170   # 認証済み
+MODERATOR_ROLE_ID = 1450755263152914432  # モデレーター
+NEW_USER_ROLE_ID = 1443870588845297694   # 新規ユーザー
+
+# チャンネルID
+WELCOME_CHANNEL_ID = 1443565022675468379 # 入室
+RULES_CHANNEL_ID = int(os.getenv('RULES_CHANNEL_ID', '0'))
+NOTIFY_CHANNEL_ID = 1443574124638375937  # ログ
+STATUS_CHANNEL_ID = 1443565022675468382  # 緊急通知
 
 # Bot管理者ID
 BOT_ADMIN_USER_ID = 0
+COMMAND_ADMIN_ROLE_ID = 1443565021509586990
 
 # DB設定
 DB_CONFIG = {
@@ -48,17 +61,15 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 
-# --- 署名追加関数 ---
+# --- 共通関数: 署名 ---
 def add_signature(embed: discord.Embed):
     signature = (
         "\n\n───────────────\n"
         "🛠️ Dev: [Minashin1120](https://x.com/Minashin1120) | 📦 [Repository](https://github.com/Minashin1120/blue_archive_non-official_discord)\n"
         "🔒 *This bot is developed exclusively for this server.*"
     )
-    if embed.description is None or embed.description == "":
-        embed.description = signature
-    else:
-        embed.description += signature
+    if embed.description is None: embed.description = signature
+    else: embed.description += signature
     return embed
 
 # --- 負荷対策クラス ---
@@ -73,13 +84,10 @@ class RateLimiter:
 
     def check_action(self, user_id):
         now = datetime.datetime.now().timestamp()
-        if now < self.global_unlock_time:
-            return "GLOBAL_LOCKED"
+        if now < self.global_unlock_time: return "GLOBAL_LOCKED"
         if user_id in self.locked_users:
-            if now < self.locked_users[user_id]:
-                return "USER_LOCKED"
-            else:
-                del self.locked_users[user_id]
+            if now < self.locked_users[user_id]: return "USER_LOCKED"
+            else: del self.locked_users[user_id]
         
         history = self.user_history[user_id]
         history.append(now)
@@ -101,12 +109,18 @@ class MyBot(commands.Bot):
         self.pool = None
 
     async def setup_hook(self):
+        # DB接続
         if not self.pool:
             self.pool = await aiomysql.create_pool(**DB_CONFIG)
+        
+        # View登録
         self.add_view(RulesView(self))
+        
+        # コマンド同期 (Discordキャッシュ対策: 毎回同期)
         try:
+            print("Syncing slash commands...")
             await self.tree.sync()
-            print("Slash commands synced.")
+            print("Slash commands synced successfully.")
         except Exception as e:
             print(f"Command sync failed: {e}")
 
@@ -114,7 +128,6 @@ class MyBot(commands.Bot):
         if self.pool:
             self.pool.close()
             await self.pool.wait_closed()
-            self.pool = None
         await super().close()
 
 bot = MyBot()
@@ -127,9 +140,9 @@ async def execute_db(query, args=None):
             await cur.execute(query, args)
             return await cur.fetchone()
 
-async def get_setting(key):
+async def get_setting(key, default=None):
     res = await execute_db("SELECT value FROM settings WHERE key_name = %s", (key,))
-    return res[0] if res else None
+    return res[0] if res else default
 
 async def set_setting(key, value):
     async with bot.pool.acquire() as conn:
@@ -160,7 +173,25 @@ async def send_attack_alert(user_id, attack_type):
     except Exception as e:
         print(f"Failed to send attack alert: {e}")
 
+async def trigger_emergency_shutdown():
+    print("!!! GLOBAL LOCKOUT TRIGGERED - SHUTTING DOWN !!!")
+    channel = bot.get_channel(STATUS_CHANNEL_ID)
+    if channel:
+        try:
+            embed = discord.Embed(
+                title="🚨 緊急停止通知",
+                description=f"集団攻撃を検知したため、システムを約 {GLOBAL_LOCKOUT_TIME // 60} 分間停止します。",
+                color=0xff0000
+            )
+            embed.timestamp = datetime.datetime.now()
+            add_signature(embed)
+            msg = await channel.send(embed=embed)
+            await set_setting('lockout_msg_id', msg.id)
+        except: pass
+    await bot.close()
+
 async def send_user_alert(member, channel, alert_type="add", is_manual=False):
+    """新規ユーザー・ロール変更通知"""
     if not channel: return
     try:
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -191,185 +222,39 @@ async def send_user_alert(member, channel, alert_type="add", is_manual=False):
     except Exception as e:
         print(f"Failed to send notification: {e}")
 
-async def trigger_emergency_shutdown():
-    print("!!! GLOBAL LOCKOUT TRIGGERED - SHUTTING DOWN !!!")
-    channel = bot.get_channel(STATUS_CHANNEL_ID)
-    if channel:
-        try:
-            embed = discord.Embed(
-                title="🚨 緊急停止通知",
-                description=f"集団攻撃を検知したため、システムを約 {GLOBAL_LOCKOUT_TIME // 60} 分間停止します。",
-                color=0xff0000
-            )
-            embed.timestamp = datetime.datetime.now()
-            add_signature(embed)
-            msg = await channel.send(embed=embed)
-            await set_setting('lockout_msg_id', msg.id)
-        except: pass
-    await bot.close()
-
-# --- View ---
-class RulesView(discord.ui.View):
-    def __init__(self, bot_instance):
-        super().__init__(timeout=None)
-        self.bot = bot_instance
-
-    @discord.ui.button(label="ルールに同意して参加", style=discord.ButtonStyle.green, custom_id="agree_rules_button")
-    async def agree_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        status = rate_limiter.check_action(interaction.user.id)
-        
-        if status == "TRIGGER_GLOBAL_LOCK":
-            await send_attack_alert(interaction.user.id, "集団攻撃トリガー (システム緊急停止)")
-            await interaction.response.send_message("🚨 異常検知。システムを緊急停止します。", ephemeral=True)
-            await trigger_emergency_shutdown()
-            return
-        elif status == "GLOBAL_LOCKED":
-            return
-        elif status == "TRIGGER_USER_LOCK":
-            await send_attack_alert(interaction.user.id, "個人スパム検知 (5分間ブロック)")
-            await interaction.response.send_message("⚠️ 操作が速すぎます。5分間ブロックします。", ephemeral=True)
-            return
-        elif status == "USER_LOCKED":
-            await interaction.response.send_message("⚠️ 操作制限中です。", ephemeral=True)
-            return
-
-        role_id = NEW_ROLE_ID
-        role = interaction.guild.get_role(role_id)
-        if not role:
-            await interaction.response.send_message("エラー: 設定エラー。", ephemeral=True)
-            return
-        
-        if role in interaction.user.roles:
-            try:
-                await interaction.user.remove_roles(role)
-                await interaction.response.send_message("ルールに同意しました。ようこそ！", ephemeral=True)
-                
-                notify_channel = self.bot.get_channel(NOTIFY_CHANNEL_ID)
-                if notify_channel:
-                    embed = discord.Embed(title="✅ ルール同意", description=f"{interaction.user.mention} がルールに同意し、参加しました。", color=0x2ecc71)
-                    if interaction.user.display_avatar: embed.set_thumbnail(url=interaction.user.display_avatar.url)
-                    embed.set_footer(text=f"User ID: {interaction.user.id}")
-                    embed.timestamp = datetime.datetime.now()
-                    add_signature(embed)
-                    await notify_channel.send(embed=embed)
-            except discord.Forbidden:
-                await interaction.response.send_message("エラー: 権限不足", ephemeral=True)
-            except Exception as e:
-                await interaction.response.send_message(f"エラー: {e}", ephemeral=True)
-        else:
-            await interaction.response.send_message("既に同意済みです。", ephemeral=True)
-
-# --- イベント & タスク ---
-@tasks.loop(minutes=60)
-async def check_new_users_task():
+async def approve_user(user, guild):
+    """認証完了処理"""
+    unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
+    verified_role = guild.get_role(VERIFIED_ROLE_ID)
+    actions = []
     try:
-        val = await get_setting('threshold_days')
-        threshold = int(val) if val else 7
-        for guild in bot.guilds:
-            role = guild.get_role(NEW_USER_ROLE_ID)
+        if unverified_role and unverified_role in user.roles:
+            await user.remove_roles(unverified_role)
+            actions.append("未認証ロール解除")
+        if verified_role and verified_role not in user.roles:
+            await user.add_roles(verified_role)
+            actions.append("認証済みロール付与")
+        
+        if actions:
             nc = bot.get_channel(NOTIFY_CHANNEL_ID)
-            if not role: continue
-            for member in role.members:
-                now = datetime.datetime.now(datetime.timezone.utc)
-                if member.created_at and (now - member.created_at).days >= threshold:
-                    try:
-                        await member.remove_roles(role)
-                        await send_user_alert(member, nc, "remove", False)
-                    except: pass
-    except: pass
-
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user}')
-    if not check_new_users_task.is_running():
-        check_new_users_task.start()
-    
-    try:
-        msg_id_str = await get_setting('lockout_msg_id')
-        if msg_id_str:
-            msg_id = int(msg_id_str)
-            sc = bot.get_channel(STATUS_CHANNEL_ID)
-            if sc:
-                try:
-                    msg = await sc.fetch_message(msg_id)
-                    await msg.delete()
-                except: pass
-                embed = discord.Embed(title="✅ システム復帰", description="システムが再起動し、正常稼働に戻りました。", color=0x2ecc71)
+            if nc:
+                embed = discord.Embed(title="✅ ユーザー認証完了", description=f"{user.mention} が認証されました。", color=0x2ecc71)
+                embed.add_field(name="処理", value="\n".join(actions))
+                embed.set_footer(text=f"ID: {user.id}")
+                embed.timestamp = datetime.datetime.now()
                 add_signature(embed)
-                await sc.send(embed=embed, delete_after=30)
-            await delete_setting('lockout_msg_id')
-    except: pass
+                await nc.send(embed=embed)
+            return True
+    except Exception as e:
+        print(f"Approval error: {e}")
+    return False
 
-@bot.event
-async def on_member_join(member):
-    if member.bot: return
-    r = member.guild.get_role(NEW_ROLE_ID)
-    if r:
-        try: await member.add_roles(r)
-        except: pass
-    
-    try:
-        val = await get_setting('threshold_days')
-        threshold = int(val) if val else 7
-        now = datetime.datetime.now(datetime.timezone.utc)
-        if member.created_at and (now - member.created_at).days < threshold:
-            nr = member.guild.get_role(NEW_USER_ROLE_ID)
-            nc = bot.get_channel(NOTIFY_CHANNEL_ID)
-            if nr:
-                await member.add_roles(nr)
-                await send_user_alert(member, nc, "add", False)
-    except: pass
-    
-    # ウェルカムメッセージ (修正箇所)
-    wc = bot.get_channel(WELCOME_CHANNEL_ID)
-    rc = bot.get_channel(RULES_CHANNEL_ID)
-    if wc and rc:
-        desc = (
-            f"**{rc.mention} を確認し、ルールへの同意をお願いします。**\n\n"
-            "当サーバーでは、荒らし対策のため参加直後はチャンネル閲覧を制限しています。\n"
-            "ルールチャンネルにある「同意ボタン」を押すと、全てのチャンネルが利用可能になります。\n\n"
-            "⚠️ **同意するまで他のチャンネルは閲覧・書き込みができません。**"
-        )
-        e = discord.Embed(title=f"🎉 ようこそ {member.name} さん！", description=desc, color=0x00ff00)
-        if member.display_avatar: e.set_thumbnail(url=member.display_avatar.url)
-        add_signature(e)
-        try: await wc.send(content=member.mention, embed=e)
-        except: pass
-
-@bot.event
-async def on_member_remove(member):
-    c = bot.get_channel(NOTIFY_CHANNEL_ID)
-    if c:
-        e = discord.Embed(title="👋 メンバー退出", description=f"{member.mention} 退出", color=0x95a5a6)
-        e.set_footer(text=f"ID: {member.id}"); e.timestamp = datetime.datetime.now()
-        add_signature(e)
-        try: await c.send(embed=e)
-        except: pass
-
-@bot.event
-async def on_member_update(before, after):
-    if before.roles == after.roles: return
-    c = bot.get_channel(NOTIFY_CHANNEL_ID)
-    if not c: return
-    added = set(after.roles) - set(before.roles)
-    removed = set(before.roles) - set(after.roles)
-    if not added and not removed: return
-    e = discord.Embed(title="🔄 ロール更新ログ", color=0xf1c40f)
-    e.description = f"{after.mention} ロール変更"
-    if after.display_avatar: e.set_thumbnail(url=after.display_avatar.url)
-    if added: e.add_field(name="➕ 付与", value=", ".join([r.mention for r in added]))
-    if removed: e.add_field(name="➖ 解除", value=", ".join([r.mention for r in removed]))
-    e.timestamp = datetime.datetime.now()
-    add_signature(e)
-    try: await c.send(embed=e)
-    except: pass
-
-# --- コマンド ---
-def is_admin_or_has_role():
+# --- 権限チェック ---
+def is_moderator():
     def predicate(interaction: discord.Interaction) -> bool:
         if interaction.user.guild_permissions.administrator: return True
         if isinstance(interaction.user, discord.Member):
-            if any(role.id == COMMAND_ADMIN_ROLE_ID for role in interaction.user.roles): return True
+            if any(role.id == MODERATOR_ROLE_ID for role in interaction.user.roles): return True
         return False
     return app_commands.check(predicate)
 
@@ -391,6 +276,188 @@ async def check_rate_limit(interaction: discord.Interaction):
         return False
     return True
 
+# --- View (同意ボタン) ---
+class RulesView(discord.ui.View):
+    def __init__(self, bot_instance):
+        super().__init__(timeout=None)
+        self.bot = bot_instance
+
+    @discord.ui.button(label="認証へ進む", style=discord.ButtonStyle.blurple, custom_id="agree_rules_button")
+    async def agree_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await check_rate_limit(interaction): return
+
+        verified_role = interaction.guild.get_role(VERIFIED_ROLE_ID)
+        if verified_role in interaction.user.roles:
+            await interaction.response.send_message("✅ 既に認証済みです。", ephemeral=True)
+            return
+
+        mode = await get_setting('verification_mode', 'button')
+        
+        if mode == 'web':
+            # JWT生成
+            payload = {'user_id': interaction.user.id, 'guild_id': interaction.guild.id, 'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=15)}
+            token = jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+            url = f"{BASE_URL}/verify?token={token}"
+            await interaction.response.send_message(f"以下のURLから認証してください。\n👉 [認証サイトへ移動]({url})", ephemeral=True)
+        else:
+            await approve_user(interaction.user, interaction.guild)
+            await interaction.response.send_message("認証が完了しました！", ephemeral=True)
+
+# --- 定期タスク ---
+@tasks.loop(minutes=60)
+async def poke_unverified_users():
+    try:
+        channel = bot.get_channel(WELCOME_CHANNEL_ID)
+        if not channel: return
+        unverified_role = channel.guild.get_role(UNVERIFIED_ROLE_ID)
+        if not unverified_role: return
+        
+        targets = [m for m in unverified_role.members if not m.bot]
+        if not targets: return
+
+        mentions = " ".join([m.mention for m in targets[:50]])
+        if len(targets) > 50: mentions += " ..."
+        
+        rc = bot.get_channel(RULES_CHANNEL_ID)
+        msg = f"{mentions}\n⚠️ **未認証のメンバーへのお知らせ**\nルールに同意し、認証を完了しないとサーバーのチャンネルを閲覧できません。\n{rc.mention if rc else '#rules'} に移動して認証を行ってください。"
+        await channel.send(msg, delete_after=3600)
+    except: pass
+
+@tasks.loop(minutes=60)
+async def check_new_users_expiry():
+    try:
+        val = await get_setting('threshold_days', '7')
+        threshold = int(val)
+        for guild in bot.guilds:
+            role = guild.get_role(NEW_USER_ROLE_ID)
+            nc = bot.get_channel(NOTIFY_CHANNEL_ID)
+            if not role: continue
+            for member in role.members:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                if member.created_at and (now - member.created_at).days >= threshold:
+                    try:
+                        await member.remove_roles(role)
+                        await send_user_alert(member, nc, "remove", False)
+                    except: pass
+    except: pass
+
+# --- イベント ---
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user}')
+    if not poke_unverified_users.is_running(): poke_unverified_users.start()
+    if not check_new_users_expiry.is_running(): check_new_users_expiry.start()
+    
+    # 復帰処理
+    try:
+        msg_id_str = await get_setting('lockout_msg_id')
+        if msg_id_str:
+            msg_id = int(msg_id_str)
+            sc = bot.get_channel(STATUS_CHANNEL_ID)
+            if sc:
+                try:
+                    msg = await sc.fetch_message(msg_id)
+                    await msg.delete()
+                except: pass
+                embed = discord.Embed(title="✅ システム復帰", description="システムが再起動し、正常稼働に戻りました。", color=0x2ecc71)
+                add_signature(embed)
+                await sc.send(embed=embed, delete_after=30)
+            await delete_setting('lockout_msg_id')
+    except: pass
+
+@bot.event
+async def on_member_join(member):
+    if member.bot: return
+    guild = member.guild
+    
+    # 1. ロール復元
+    restored = False
+    try:
+        async with bot.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT role_ids FROM user_role_backups WHERE user_id = %s", (member.id,))
+                res = await cur.fetchone()
+                if res:
+                    role_ids = json.loads(res[0])
+                    roles_to_add = []
+                    for rid in role_ids:
+                        r = guild.get_role(rid)
+                        if r and not r.is_default() and not r.managed and r < guild.me.top_role:
+                            roles_to_add.append(r)
+                    if roles_to_add:
+                        await member.add_roles(*roles_to_add)
+                        restored = True
+    except: pass
+
+    # 2. 未認証ロール付与 (認証済みでなければ)
+    verified_role = guild.get_role(VERIFIED_ROLE_ID)
+    if not (restored and verified_role in member.roles):
+        unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
+        if unverified_role:
+            try: await member.add_roles(unverified_role)
+            except: pass
+
+    # 3. 新規アカウントチェック
+    try:
+        val = await get_setting('threshold_days', '7')
+        threshold = int(val)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if member.created_at and (now - member.created_at).days < threshold:
+            new_user_role = guild.get_role(NEW_USER_ROLE_ID)
+            nc = bot.get_channel(NOTIFY_CHANNEL_ID)
+            if new_user_role:
+                await member.add_roles(new_user_role)
+                await send_user_alert(member, nc, "add", False)
+    except: pass
+
+    # 4. ウェルカムメッセージ
+    wc = guild.get_channel(WELCOME_CHANNEL_ID)
+    rc = guild.get_channel(RULES_CHANNEL_ID)
+    if wc and rc:
+        desc = f"ようこそ {member.mention} さん！\n\n{rc.mention} を確認し、認証を行ってください。"
+        if restored: desc += "\n\n🔄 **以前のロール設定を復元しました。**"
+        desc += "\n\n⚠️ **同意するまで他のチャンネルは閲覧できません。**"
+        
+        embed = discord.Embed(title="🎉 サーバーへようこそ", description=desc, color=0x00ff00)
+        add_signature(embed)
+        await wc.send(content=member.mention, embed=embed)
+
+@bot.event
+async def on_member_remove(member):
+    if member.bot: return
+    try:
+        role_ids = [r.id for r in member.roles if not r.is_default() and not r.managed]
+        if role_ids:
+            async with bot.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("INSERT INTO user_role_backups (user_id, role_ids) VALUES (%s, %s) ON DUPLICATE KEY UPDATE role_ids = %s", (member.id, json.dumps(role_ids), json.dumps(role_ids)))
+    except: pass
+    nc = bot.get_channel(NOTIFY_CHANNEL_ID)
+    if nc:
+        embed = discord.Embed(title="👋 メンバー退出", description=f"{member.mention} ({member.name})", color=0x95a5a6)
+        embed.set_footer(text=f"ID: {member.id}"); embed.timestamp = datetime.datetime.now()
+        add_signature(embed)
+        await nc.send(embed=embed)
+
+@bot.event
+async def on_member_update(before, after):
+    if before.roles == after.roles: return
+    c = bot.get_channel(NOTIFY_CHANNEL_ID)
+    if not c: return
+    added = set(after.roles) - set(before.roles)
+    removed = set(before.roles) - set(after.roles)
+    if not added and not removed: return
+    e = discord.Embed(title="🔄 ロール更新ログ", color=0xf1c40f)
+    e.description = f"{after.mention} ロール変更"
+    if after.display_avatar: e.set_thumbnail(url=after.display_avatar.url)
+    if added: e.add_field(name="➕ 付与", value=", ".join([r.mention for r in added]))
+    if removed: e.add_field(name="➖ 解除", value=", ".join([r.mention for r in removed]))
+    e.timestamp = datetime.datetime.now()
+    add_signature(e)
+    try: await c.send(embed=e)
+    except: pass
+
+# --- コマンド定義 ---
 @bot.tree.command(name="ping", description="Ping")
 async def ping(interaction: discord.Interaction):
     if not await check_rate_limit(interaction): return
@@ -399,19 +466,49 @@ async def ping(interaction: discord.Interaction):
     add_signature(embed)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="deploy_rules", description="認証パネル設置")
+@is_moderator()
+async def deploy_rules(interaction: discord.Interaction):
+    embed = discord.Embed(title="🛡️ サーバー認証", description="下のボタンを押して認証プロセスに進んでください。", color=0x3498db)
+    add_signature(embed)
+    await interaction.channel.send(embed=embed, view=RulesView(bot))
+    await interaction.response.send_message("設置完了", ephemeral=True)
+
+@bot.tree.command(name="toggle_verification", description="認証モード切替")
+@is_moderator()
+@app_commands.choices(mode=[app_commands.Choice(name="Web", value="web"), app_commands.Choice(name="Button", value="button")])
+async def toggle_verification(interaction: discord.Interaction, mode: str):
+    await set_setting('verification_mode', mode)
+    await interaction.response.send_message(f"モード変更: {mode}", ephemeral=True)
+
+@bot.tree.command(name="revoke_verification", description="認証取消")
+@is_moderator()
+async def revoke_verification(interaction: discord.Interaction, target: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        roles_to_remove = [r for r in target.roles if not r.is_default() and not r.managed and r < interaction.guild.me.top_role]
+        if roles_to_remove: await target.remove_roles(*roles_to_remove)
+        unverified = interaction.guild.get_role(UNVERIFIED_ROLE_ID)
+        if unverified: await target.add_roles(unverified)
+        await interaction.followup.send(f"{target.mention} の認証を取り消しました。")
+    except Exception as e: await interaction.followup.send(f"エラー: {e}")
+
+@bot.tree.command(name="set_new_account_days", description="新規判定日数")
+@is_moderator()
+async def set_new_account_days(interaction: discord.Interaction, days: int):
+    await set_setting('threshold_days', days)
+    await interaction.response.send_message(f"設定更新: {days}日", ephemeral=True)
+
 @bot.tree.command(name="scan_users", description="手動スキャン")
-@is_admin_or_has_role()
+@is_moderator()
 async def scan_users(interaction: discord.Interaction):
     if not await check_rate_limit(interaction): return
-    await interaction.response.send_message("スキャン開始...", ephemeral=True)
-    
-    val = await get_setting('threshold_days')
-    threshold = int(val) if val else 7
+    await interaction.response.send_message("スキャン中...", ephemeral=True)
+    val = await get_setting('threshold_days', '7'); threshold = int(val)
     role_new = interaction.guild.get_role(NEW_USER_ROLE_ID)
     nc = bot.get_channel(NOTIFY_CHANNEL_ID)
     cnt_add=0; cnt_rem=0
     now = datetime.datetime.now(datetime.timezone.utc)
-    
     for m in interaction.guild.members:
         if m.bot or not m.created_at: continue
         age = now - m.created_at
@@ -431,25 +528,11 @@ async def scan_users(interaction: discord.Interaction):
                     await send_user_alert(m, nc, "remove", True)
                     await asyncio.sleep(0.5)
                 except: pass
-    await interaction.followup.send(f"完了: +{cnt_add} / -{cnt_rem}", ephemeral=True)
-
-@bot.tree.command(name="deploy_rules", description="パネル設置")
-@is_admin_or_has_role()
-async def deploy_rules(interaction: discord.Interaction):
-    if not await check_rate_limit(interaction): return
-    e = discord.Embed(title="📜 ルール同意", description="確認してボタンを押してください。", color=0xff0000)
-    add_signature(e)
-    await interaction.channel.send(embed=e, view=RulesView(bot))
-    await interaction.response.send_message("設置完了", ephemeral=True)
-
-@bot.tree.command(name="set_new_account_days", description="期間設定")
-@is_admin_or_has_role()
-async def set_new_account_days(interaction: discord.Interaction, days: int):
-    if not await check_rate_limit(interaction): return
-    await set_setting('threshold_days', days)
-    await interaction.response.send_message(f"設定更新: {days}日", ephemeral=True)
+    await interaction.followup.send(f"完了 (+{cnt_add}/-{cnt_rem})", ephemeral=True)
 
 @deploy_rules.error
+@toggle_verification.error
+@revoke_verification.error
 @set_new_account_days.error
 @scan_users.error
 @ping.error
@@ -461,13 +544,47 @@ async def command_error(interaction: discord.Interaction, error):
         except: pass
 
 # --- Webサーバー & メインループ ---
-async def privacy_handler(request): return web.FileResponse(f"{os.getcwd()}/templates/privacy.html")
-async def terms_handler(request): return web.FileResponse(f"{os.getcwd()}/templates/terms.html")
-async def root_handler(request): return web.Response(text="Bot is running.")
+async def verify_page(request):
+    token = request.query.get('token')
+    if not token: return web.Response(text="Token missing", status=400)
+    try:
+        with open(f"{os.getcwd()}/templates/verify.html", "r") as f:
+            html = f.read()
+        return web.Response(text=html.replace("{token}", token).replace("{site_key}", CF_SITE_KEY), content_type='text/html')
+    except: return web.Response(text="Template missing", status=500)
+
+async def verify_submit(request):
+    data = await request.post()
+    token = data.get('token')
+    cf_response = data.get('cf-turnstile-response')
+    if not token or not cf_response: return web.Response(text="Invalid Request", status=400)
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+        user_id = payload['user_id']
+        guild_id = payload['guild_id']
+    except: return web.Response(text="Invalid Token", status=403)
+        
+    async with aiohttp.ClientSession() as session:
+        async with session.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', data={
+            'secret': CF_SECRET_KEY, 'response': cf_response
+        }) as resp:
+            result = await resp.json()
+            if not result.get('success'): return web.Response(text="Captcha Failed", status=403)
+
+    guild = bot.get_guild(guild_id)
+    if guild:
+        member = guild.get_member(user_id)
+        if member:
+            await approve_user(member, guild)
+            try:
+                with open(f"{os.getcwd()}/templates/success.html", "r") as f:
+                    return web.Response(text=f.read(), content_type='text/html')
+            except: return web.Response(text="Success", status=200)
+    return web.Response(text="Error", status=404)
 
 async def start_web_server():
     app = web.Application()
-    app.add_routes([web.get('/', root_handler), web.get('/privacy', privacy_handler), web.get('/terms', terms_handler)])
+    app.add_routes([web.get('/verify', verify_page), web.post('/verify/submit', verify_submit), web.get('/', lambda r: web.Response(text="Bot OK"))])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
