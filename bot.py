@@ -46,20 +46,14 @@ DB_CONFIG = {
     'autocommit': True
 }
 
-# --- 負荷対策設定 (ランダム化) ---
+# --- 負荷対策設定 ---
 RATE_LIMIT_ACTIONS = 5
 RATE_LIMIT_WINDOW = 10
-
-# ユーザーブロック時間 (秒)
-USER_LOCKOUT_MIN = 300  # 5分
-USER_LOCKOUT_MAX = 600  # 10分
-
-# 全体シャットダウン閾値
+USER_LOCKOUT_MIN = 300
+USER_LOCKOUT_MAX = 600
 GLOBAL_LOCKOUT_THRESHOLD = 5
-
-# 全体シャットダウン時間 (秒)
-GLOBAL_LOCKOUT_MIN = 600  # 10分
-GLOBAL_LOCKOUT_MAX = 1800 # 30分
+GLOBAL_LOCKOUT_MIN = 600
+GLOBAL_LOCKOUT_MAX = 1800
 
 intents = discord.Intents.default()
 intents.members = True
@@ -87,40 +81,23 @@ class RateLimiter:
         return datetime.datetime.now().timestamp() < self.global_unlock_time
 
     def check_action(self, user_id):
-        """
-        戻り値: (ステータス文字列, ロック時間(秒/None))
-        """
         now = datetime.datetime.now().timestamp()
-        
-        # 全体ロック中
-        if now < self.global_unlock_time:
-            return "GLOBAL_LOCKED", None
-
-        # ユーザーロック中
+        if now < self.global_unlock_time: return "GLOBAL_LOCKED", None
         if user_id in self.locked_users:
-            if now < self.locked_users[user_id]:
-                return "USER_LOCKED", None
-            else:
-                del self.locked_users[user_id]
+            if now < self.locked_users[user_id]: return "USER_LOCKED", None
+            else: del self.locked_users[user_id]
         
-        # 履歴チェック
         history = self.user_history[user_id]
         history.append(now)
         if len(history) == RATE_LIMIT_ACTIONS:
-            # 短期間に規定回数アクション
             if now - history[0] < RATE_LIMIT_WINDOW:
-                # ユーザーロック時間をランダム決定
                 user_duration = random.randint(USER_LOCKOUT_MIN, USER_LOCKOUT_MAX)
                 self.locked_users[user_id] = now + user_duration
-                
-                # 全体ロック判定
                 active_locks = sum(1 for t in self.locked_users.values() if t > now)
                 if active_locks >= GLOBAL_LOCKOUT_THRESHOLD:
-                    # 全体ロック時間をランダム決定
                     global_duration = random.randint(GLOBAL_LOCKOUT_MIN, GLOBAL_LOCKOUT_MAX)
                     self.global_unlock_time = now + global_duration
                     return "TRIGGER_GLOBAL_LOCK", global_duration
-                
                 return "TRIGGER_USER_LOCK", user_duration
         return "OK", None
 
@@ -132,20 +109,13 @@ class MyBot(commands.Bot):
         self.pool = None
 
     async def setup_hook(self):
-        if not self.pool:
-            self.pool = await aiomysql.create_pool(**DB_CONFIG)
+        if not self.pool: self.pool = await aiomysql.create_pool(**DB_CONFIG)
         self.add_view(RulesView(self))
-        try:
-            await self.tree.sync()
-            print("Slash commands synced.")
-        except Exception as e:
-            print(f"Command sync failed: {e}")
+        try: await self.tree.sync(); print("Slash commands synced.")
+        except Exception as e: print(f"Command sync failed: {e}")
 
     async def close(self):
-        if self.pool:
-            self.pool.close()
-            await self.pool.wait_closed()
-            self.pool = None
+        if self.pool: self.pool.close(); await self.pool.wait_closed(); self.pool = None
         await super().close()
 
 bot = MyBot()
@@ -165,10 +135,7 @@ async def get_setting(key, default=None):
 async def set_setting(key, value):
     async with bot.pool.acquire() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "INSERT INTO settings (key_name, value) VALUES (%s, %s) ON DUPLICATE KEY UPDATE value = %s",
-                (key, str(value), str(value))
-            )
+            await cur.execute("INSERT INTO settings (key_name, value) VALUES (%s, %s) ON DUPLICATE KEY UPDATE value = %s", (key, str(value), str(value)))
 
 async def delete_setting(key):
     async with bot.pool.acquire() as conn:
@@ -177,7 +144,6 @@ async def delete_setting(key):
 
 # --- 通知処理 ---
 async def send_attack_alert(user_id, attack_type, duration=None):
-    """管理者へ攻撃を通知（正確な時間を記載）"""
     channel = bot.get_channel(NOTIFY_CHANNEL_ID)
     if not channel: return
     try:
@@ -186,29 +152,19 @@ async def send_attack_alert(user_id, attack_type, duration=None):
         embed.description = "レートリミットに抵触する過剰な操作を検知しました。"
         embed.add_field(name="実行者", value=f"<@{user_id}> (ID: {user_id})", inline=False)
         embed.add_field(name="検知内容", value=attack_type, inline=False)
-        if duration:
-            embed.add_field(name="ロック時間(管理者用)", value=f"{duration}秒 (ランダム)", inline=False)
+        if duration: embed.add_field(name="ロック時間(管理者用)", value=f"{duration}秒 (ランダム)", inline=False)
         embed.timestamp = datetime.datetime.now()
         add_signature(embed)
         await channel.send(content=admin_mention, embed=embed)
-    except Exception as e:
-        print(f"Failed to send attack alert: {e}")
+    except: pass
 
 async def trigger_emergency_shutdown(duration):
-    """緊急停止処理（管理者へ正確な時間を通知して切断）"""
     print(f"!!! GLOBAL LOCKOUT - SHUTTING DOWN FOR {duration}s !!!")
     channel = bot.get_channel(STATUS_CHANNEL_ID)
     if channel:
         try:
-            embed = discord.Embed(
-                title="🚨 緊急停止通知",
-                description="集団攻撃を検知したため、システムを一時停止します。\n再開時間はセキュリティのため非公開です。",
-                color=0xff0000
-            )
-            # 管理者にはこっそり時間を教えるため、Footerに入れるか、別途通知する
-            # ここではFooterに入れておく（一般ユーザーはここまで見ない前提、または管理者CHなのでOK）
-            embed.set_footer(text=f"復帰予定: {duration}秒後 (ランダム設定)")
-            embed.timestamp = datetime.datetime.now()
+            embed = discord.Embed(title="🚨 緊急停止通知", description="集団攻撃を検知したため、システムを一時停止します。\n再開時間はセキュリティのため非公開です。", color=0xff0000)
+            embed.set_footer(text=f"復帰予定: {duration}秒後 (ランダム設定)"); embed.timestamp = datetime.datetime.now()
             add_signature(embed)
             msg = await channel.send(embed=embed)
             await set_setting('lockout_msg_id', msg.id)
@@ -219,11 +175,10 @@ async def send_user_alert(member, channel, alert_type="add", is_manual=False):
     if not channel: return
     try:
         now = datetime.datetime.now(datetime.timezone.utc)
+        days=0; hours=0
         if member.created_at:
             diff = now - member.created_at
-            days = diff.days
-            hours = diff.seconds // 3600
-        else: days=0; hours=0
+            days = diff.days; hours = diff.seconds // 3600
         embed = discord.Embed()
         if alert_type == "add":
             embed.title = "ℹ️ 新規ユーザー検知"
@@ -258,42 +213,29 @@ async def approve_user(user, guild):
             if nc:
                 embed = discord.Embed(title="✅ ユーザー認証完了", description=f"{user.mention} が認証されました。", color=0x2ecc71)
                 embed.add_field(name="処理", value="\n".join(actions))
-                embed.set_footer(text=f"ID: {user.id}")
-                embed.timestamp = datetime.datetime.now()
+                embed.set_footer(text=f"ID: {user.id}"); embed.timestamp = datetime.datetime.now()
                 add_signature(embed)
                 await nc.send(embed=embed)
             return True
     except: pass
     return False
 
-# --- 共通の負荷チェック関数 (コマンド/ボタン用) ---
+# --- 共通の負荷チェック ---
 async def check_rate_limit(interaction: discord.Interaction):
     status, duration = rate_limiter.check_action(interaction.user.id)
-    
     if status == "TRIGGER_GLOBAL_LOCK":
-        # 攻撃検知: 管理者には時間を通知
         await send_attack_alert(interaction.user.id, "集団攻撃トリガー (システム緊急停止)", duration)
-        # ユーザーには詳細を伏せる
         await interaction.response.send_message("🚨 異常検知。システムを緊急停止します。", ephemeral=True)
         await trigger_emergency_shutdown(duration)
         return False
-        
-    elif status == "GLOBAL_LOCKED":
-        # ここは基本的に通らない（切断中）だが、もし接続があれば
-        return False
-        
+    elif status == "GLOBAL_LOCKED": return False
     elif status == "TRIGGER_USER_LOCK":
-        # 個人スパム: 管理者には時間を通知
         await send_attack_alert(interaction.user.id, "個人スパム検知 (ブロック)", duration)
-        # ユーザーには詳細を伏せる
         await interaction.response.send_message("⚠️ 操作が速すぎます。しばらくの間、操作をブロックします。", ephemeral=True)
         return False
-        
     elif status == "USER_LOCKED":
-        # 既にロック中
         await interaction.response.send_message("⚠️ 操作制限中です。解除されるまでお待ちください。", ephemeral=True)
         return False
-        
     return True
 
 # --- View ---
@@ -304,16 +246,12 @@ class RulesView(discord.ui.View):
 
     @discord.ui.button(label="認証へ進む", style=discord.ButtonStyle.blurple, custom_id="agree_rules_button")
     async def agree_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 負荷チェック
         if not await check_rate_limit(interaction): return
-
         verified_role = interaction.guild.get_role(VERIFIED_ROLE_ID)
         if verified_role in interaction.user.roles:
             await interaction.response.send_message("✅ 既に認証済みです。", ephemeral=True)
             return
-
         mode = await get_setting('verification_mode', 'button')
-        
         if mode == 'web':
             payload = {'user_id': interaction.user.id, 'guild_id': interaction.guild.id, 'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=15)}
             token = jwt.encode(payload, JWT_SECRET, algorithm='HS256')
@@ -345,32 +283,25 @@ async def ping(interaction: discord.Interaction):
 async def scan_users(interaction: discord.Interaction):
     if not await check_rate_limit(interaction): return
     await interaction.response.send_message("スキャン開始...", ephemeral=True)
-    
-    val = await get_setting('threshold_days')
-    threshold = int(val) if val else 7
+    val = await get_setting('threshold_days'); threshold = int(val) if val else 7
     role_new = interaction.guild.get_role(NEW_USER_ROLE_ID)
     nc = bot.get_channel(NOTIFY_CHANNEL_ID)
     cnt_add=0; cnt_rem=0
     now = datetime.datetime.now(datetime.timezone.utc)
-    
     for m in interaction.guild.members:
         if m.bot or not m.created_at: continue
         age = now - m.created_at
         if age.days < threshold:
             if role_new not in m.roles:
                 try:
-                    await m.add_roles(role_new)
-                    cnt_add+=1
-                    await send_user_alert(m, nc, "add", True)
-                    await asyncio.sleep(0.5)
+                    await m.add_roles(role_new); cnt_add+=1
+                    await send_user_alert(m, nc, "add", True); await asyncio.sleep(0.5)
                 except: pass
         else:
             if role_new in m.roles:
                 try:
-                    await m.remove_roles(role_new)
-                    cnt_rem+=1
-                    await send_user_alert(m, nc, "remove", True)
-                    await asyncio.sleep(0.5)
+                    await m.remove_roles(role_new); cnt_rem+=1
+                    await send_user_alert(m, nc, "remove", True); await asyncio.sleep(0.5)
                 except: pass
     await interaction.followup.send(f"完了 (+{cnt_add}/-{cnt_rem})", ephemeral=True)
 
@@ -378,9 +309,9 @@ async def scan_users(interaction: discord.Interaction):
 @is_moderator()
 async def deploy_rules(interaction: discord.Interaction):
     if not await check_rate_limit(interaction): return
-    embed = discord.Embed(title="🛡️ サーバー認証", description="下のボタンを押して認証プロセスに進んでください。", color=0x3498db)
-    add_signature(embed)
-    await interaction.channel.send(embed=embed, view=RulesView(bot))
+    e = discord.Embed(title="🛡️ サーバー認証", description="下のボタンを押して認証プロセスに進んでください。", color=0x3498db)
+    add_signature(e)
+    await interaction.channel.send(embed=e, view=RulesView(bot))
     await interaction.response.send_message("設置完了", ephemeral=True)
 
 @bot.tree.command(name="toggle_verification", description="モード切替")
@@ -404,7 +335,7 @@ async def revoke_verification(interaction: discord.Interaction, target: discord.
         await interaction.followup.send(f"{target.mention} の認証を取り消しました。")
     except Exception as e: await interaction.followup.send(f"エラー: {e}")
 
-@bot.tree.command(name="set_new_account_days", description="日数設定")
+@bot.tree.command(name="set_new_account_days", description="期間設定")
 @is_moderator()
 async def set_new_account_days(interaction: discord.Interaction, days: int):
     if not await check_rate_limit(interaction): return
@@ -424,8 +355,8 @@ async def command_error(interaction: discord.Interaction, error):
         try: await interaction.response.send_message(f"エラー: {error}", ephemeral=True)
         except: pass
 
-# --- タスク ---
-@tasks.loop(minutes=60)
+# --- 定期タスク (ここを変更) ---
+@tasks.loop(hours=72) # 3日に1回に変更
 async def poke_unverified_users():
     try:
         channel = bot.get_channel(WELCOME_CHANNEL_ID)
@@ -438,14 +369,15 @@ async def poke_unverified_users():
         if len(targets) > 50: mentions += " ..."
         rc = bot.get_channel(RULES_CHANNEL_ID)
         msg = f"{mentions}\n⚠️ **未認証のメンバーへのお知らせ**\nルールに同意し、認証を完了しないとサーバーのチャンネルを閲覧できません。\n{rc.mention if rc else '#rules'} に移動して認証を行ってください。"
-        await channel.send(msg, delete_after=3600)
+        
+        # 24時間 (86400秒) で削除するように変更
+        await channel.send(msg, delete_after=86400)
     except: pass
 
 @tasks.loop(minutes=60)
 async def check_new_users_expiry():
     try:
-        val = await get_setting('threshold_days', '7')
-        threshold = int(val)
+        val = await get_setting('threshold_days', '7'); threshold = int(val)
         for guild in bot.guilds:
             role = guild.get_role(NEW_USER_ROLE_ID)
             nc = bot.get_channel(NOTIFY_CHANNEL_ID)
@@ -453,182 +385,62 @@ async def check_new_users_expiry():
             for member in role.members:
                 now = datetime.datetime.now(datetime.timezone.utc)
                 if member.created_at and (now - member.created_at).days >= threshold:
-                    try:
-                        await member.remove_roles(role)
-                        await send_user_alert(member, nc, "remove", False)
+                    try: await member.remove_roles(role); await send_user_alert(member, nc, "remove", False)
                     except: pass
     except: pass
 
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user}')
-    if not poke_unverified_users.is_running(): poke_unverified_users.start()
-    if not check_new_users_expiry.is_running(): check_new_users_expiry.start()
-    
-    # 復帰処理
-    try:
-        msg_id_str = await get_setting('lockout_msg_id')
-        if msg_id_str:
-            msg_id = int(msg_id_str)
-            sc = bot.get_channel(STATUS_CHANNEL_ID)
-            if sc:
-                try:
-                    msg = await sc.fetch_message(msg_id)
-                    await msg.delete()
-                except: pass
-                embed = discord.Embed(title="✅ システム復帰", description="システムが再起動し、正常稼働に戻りました。", color=0x2ecc71)
-                add_signature(embed)
-                await sc.send(embed=embed, delete_after=30)
-            await delete_setting('lockout_msg_id')
-    except: pass
+# --- Webサーバー & メインループ ---
+async def privacy_handler(request): return web.FileResponse(f"{os.getcwd()}/templates/privacy.html")
+async def terms_handler(request): return web.FileResponse(f"{os.getcwd()}/templates/terms.html")
+async def root_handler(request): return web.Response(text="Bot is running.")
 
-@bot.event
-async def on_member_join(member):
-    if member.bot: return
-    guild = member.guild
-    restored = False
-    try:
-        async with bot.pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT role_ids FROM user_role_backups WHERE user_id = %s", (member.id,))
-                res = await cur.fetchone()
-                if res:
-                    role_ids = json.loads(res[0])
-                    roles_to_add = []
-                    for rid in role_ids:
-                        r = guild.get_role(rid)
-                        if r and not r.is_default() and not r.managed and r < guild.me.top_role:
-                            roles_to_add.append(r)
-                    if roles_to_add:
-                        await member.add_roles(*roles_to_add)
-                        restored = True
-    except: pass
+async def start_web_server():
+    app = web.Application()
+    app.add_routes([web.get('/', root_handler), web.get('/privacy', privacy_handler), web.get('/terms', terms_handler)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
 
-    verified_role = guild.get_role(VERIFIED_ROLE_ID)
-    if not (restored and verified_role in member.roles):
-        unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
-        if unverified_role:
-            try: await member.add_roles(unverified_role)
-            except: pass
-
-    try:
-        val = await get_setting('threshold_days', '7')
-        threshold = int(val)
-        now = datetime.datetime.now(datetime.timezone.utc)
-        if member.created_at and (now - member.created_at).days < threshold:
-            new_user_role = guild.get_role(NEW_USER_ROLE_ID)
-            nc = bot.get_channel(NOTIFY_CHANNEL_ID)
-            if new_user_role:
-                await member.add_roles(new_user_role)
-                await send_user_alert(member, nc, "add", False)
-    except: pass
-
-    wc = guild.get_channel(WELCOME_CHANNEL_ID)
-    rc = guild.get_channel(RULES_CHANNEL_ID)
-    if wc and rc:
-        desc = f"ようこそ {member.mention} さん！\n\n{rc.mention} を確認し、認証を行ってください。"
-        if restored: desc += "\n\n🔄 **以前のロール設定を復元しました。**"
-        desc += "\n\n⚠️ **同意するまで他のチャンネルは閲覧できません。**"
-        embed = discord.Embed(title="🎉 サーバーへようこそ", description=desc, color=0x00ff00)
-        add_signature(embed)
-        await wc.send(content=member.mention, embed=embed)
-
-@bot.event
-async def on_member_remove(member):
-    if member.bot: return
-    try:
-        role_ids = [r.id for r in member.roles if not r.is_default() and not r.managed]
-        if role_ids:
-            async with bot.pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("INSERT INTO user_role_backups (user_id, role_ids) VALUES (%s, %s) ON DUPLICATE KEY UPDATE role_ids = %s", (member.id, json.dumps(role_ids), json.dumps(role_ids)))
-    except: pass
-    nc = bot.get_channel(NOTIFY_CHANNEL_ID)
-    if nc:
-        embed = discord.Embed(title="👋 メンバー退出", description=f"{member.mention} ({member.name})", color=0x95a5a6)
-        embed.set_footer(text=f"ID: {member.id}"); embed.timestamp = datetime.datetime.now()
-        add_signature(embed)
-        await nc.send(embed=embed)
-
-@bot.event
-async def on_member_update(before, after):
-    if before.roles == after.roles: return
-    c = bot.get_channel(NOTIFY_CHANNEL_ID)
-    if not c: return
-    added = set(after.roles) - set(before.roles)
-    removed = set(before.roles) - set(after.roles)
-    if not added and not removed: return
-    e = discord.Embed(title="🔄 ロール更新ログ", color=0xf1c40f)
-    e.description = f"{after.mention} ロール変更"
-    if after.display_avatar: e.set_thumbnail(url=after.display_avatar.url)
-    if added: e.add_field(name="➕ 付与", value=", ".join([r.mention for r in added]))
-    if removed: e.add_field(name="➖ 解除", value=", ".join([r.mention for r in removed]))
-    e.timestamp = datetime.datetime.now()
-    add_signature(e)
-    try: await c.send(embed=e)
-    except: pass
-
-# --- Webサーバー ---
 async def verify_page(request):
     token = request.query.get('token')
     if not token: return web.Response(text="Token missing", status=400)
     try:
-        with open(f"{os.getcwd()}/templates/verify.html", "r") as f:
-            html = f.read()
+        with open(f"{os.getcwd()}/templates/verify.html", "r") as f: html = f.read()
         return web.Response(text=html.replace("{token}", token).replace("{site_key}", CF_SITE_KEY), content_type='text/html')
     except: return web.Response(text="Template missing", status=500)
 
 async def verify_submit(request):
     data = await request.post()
-    token = data.get('token')
-    cf_response = data.get('cf-turnstile-response')
+    token = data.get('token'); cf_response = data.get('cf-turnstile-response')
     if not token or not cf_response: return web.Response(text="Invalid Request", status=400)
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
-        user_id = payload['user_id']
-        guild_id = payload['guild_id']
+    try: payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256']); user_id = payload['user_id']; guild_id = payload['guild_id']
     except: return web.Response(text="Invalid Token", status=403)
-        
     async with aiohttp.ClientSession() as session:
-        async with session.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', data={
-            'secret': CF_SECRET_KEY, 'response': cf_response
-        }) as resp:
+        async with session.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', data={'secret': CF_SECRET_KEY, 'response': cf_response}) as resp:
             result = await resp.json()
             if not result.get('success'): return web.Response(text="Captcha Failed", status=403)
-
     guild = bot.get_guild(guild_id)
     if guild:
         member = guild.get_member(user_id)
         if member:
             await approve_user(member, guild)
             try:
-                with open(f"{os.getcwd()}/templates/success.html", "r") as f:
-                    return web.Response(text=f.read(), content_type='text/html')
+                with open(f"{os.getcwd()}/templates/success.html", "r") as f: return web.Response(text=f.read(), content_type='text/html')
             except: return web.Response(text="Success", status=200)
     return web.Response(text="Error", status=404)
 
-async def start_web_server():
-    app = web.Application()
-    app.add_routes([web.get('/verify', verify_page), web.post('/verify/submit', verify_submit), web.get('/', lambda r: web.Response(text="Bot OK"))])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-
 async def main():
-    asyncio.create_task(start_web_server())
+    app = web.Application()
+    app.add_routes([web.get('/verify', verify_page), web.post('/verify/submit', verify_submit), web.get('/', root_handler), web.get('/privacy', privacy_handler), web.get('/terms', terms_handler)])
+    runner = web.AppRunner(app); await runner.setup(); site = web.TCPSite(runner, '0.0.0.0', PORT); await site.start()
+    
     while True:
-        try:
-            print("Connecting...")
-            await bot.start(TOKEN)
-        except Exception as e:
-            print(f"Closed: {e}")
-        
+        try: print("Connecting..."); await bot.start(TOKEN)
+        except Exception as e: print(f"Closed: {e}")
         if rate_limiter.is_globally_locked():
             wt = rate_limiter.global_unlock_time - datetime.datetime.now().timestamp()
-            if wt > 0:
-                print(f"Global lockout: Sleeping {wt:.1f}s")
-                await asyncio.sleep(wt)
+            if wt > 0: print(f"Global lockout: Sleeping {wt:.1f}s"); await asyncio.sleep(wt)
             else: await asyncio.sleep(5)
         else: await asyncio.sleep(5)
 
